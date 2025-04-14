@@ -1,5 +1,9 @@
 /*****INCLUDES*****/
 
+#define _DEFAULT_SOURCE
+#define  _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <asm-generic/errno-base.h>
 #include <asm-generic/ioctls.h>
 #include <errno.h>
@@ -7,7 +11,7 @@
 #include <unistd.h>
 #include <termios.h>
 #include <stdlib.h>
-#include <ctype.h>
+#include <sys/types.h> 
 #include <sys/ioctl.h>
 #include <stdio.h> 
 #include <string.h> 
@@ -16,15 +20,39 @@
 /*****DEFINE*****/ 
 #define CTRL_KEY(k) ((k) & 0x1f)
 #define ABUF_INIT {NULL, 0}
-#define SANSA_VERSION "0.0.1"
+#define SANSA_VERSION "0.0.2"
+#define TAB_STOP 8
+
+
+enum editorKey{
+    ARROW_LEFT = 'd',
+    ARROW_RIGHT = 'f',
+    ARROW_UP = 'k',
+    ARROW_DOWN = 'j'
+};
+
 
 /*****DATA*****/
+typedef struct erow{
+    int size;
+    int rsize;
+    char *chars;
+    char *render;
+}erow;
+
+
+
 
 struct editorConfig{
-    int cx, cy;
+    int cx, cy, rx;
+    int rowoff;
+    int coloff;
     int screenrows;
     int screencolumns;
+    int numrows;
+    erow *row;
     struct termios originalTerm;
+    char *filename;
 };
 
 struct editorConfig term;
@@ -76,9 +104,27 @@ char editorKeyReader(){
     int nread;
     char keyPress;
     while((nread  = read(STDIN_FILENO, &keyPress, 1)) != 1){
-        if(nread == -1 && errno != EAGAIN) die("read");
+        if (nread == -1 && errno != EAGAIN) die("read");
     }
-    return keyPress;
+
+    if(keyPress == '\x1b'){
+        char seq[3];
+        if(read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
+        if(read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
+        if(seq[0] == '['){
+            switch(seq[1]){
+                case 'A' : return ARROW_UP;
+                case 'B' : return ARROW_DOWN;
+                case 'C' : return ARROW_RIGHT;
+                case 'D' : return ARROW_LEFT;
+            }
+        }
+    
+        return '\x1b';
+    }
+    else{
+        return keyPress;
+    }
 }
 
 int getCursorPosition(int *rows, int *columns){
@@ -114,6 +160,79 @@ int getWindowSize(int *rows, int *columns){
         return 0;
     }
 }
+/*****ROWOPS*****/ 
+int rowCXtoRX(erow *row, int cx){
+    int rx = 0;
+    for(int i = 0; i < cx; i++){
+        if(row->chars[i] == '\t'){
+            rx += (TAB_STOP - 1) - (rx % TAB_STOP);
+        }
+        rx++;
+    }
+    
+    return rx;
+}
+
+
+void rowUpdate(erow *row){
+    int tabs = 0;
+    for(int i = 0; i < row->size; i++){
+        if(row->chars[i] == '\t') tabs++;
+    }
+    free(row->render);
+    row->render = malloc(row->size + 1 + tabs*(TAB_STOP - 1)) ;
+    
+    int idx = 0;
+    for(int i = 0; i < row->size; i++){
+        if(row->chars[i] == '\t'){
+            row->render[idx++] = ' ';
+            while(idx % TAB_STOP != 0) row->render[idx++] = ' ';
+        }
+        else{
+            row->render[idx++] = row->chars[i];
+        }
+    }
+    row->render[idx] = '\0';
+    row->rsize = idx;
+
+}
+
+
+void rowAppend(char *line, ssize_t linelen){
+        term.row = realloc(term.row, sizeof(erow) * (term.numrows + 1));
+        
+        int at = term.numrows;
+        term.row[at].size = linelen;
+        term.row[at].chars = malloc(linelen + 1);
+        memcpy(term.row[at].chars, line, linelen);
+        term.row[at].chars[linelen] = '\0';
+        term.numrows++;
+        term.row[at].rsize = 0;
+        term.row[at].render = NULL;
+        rowUpdate(&term.row[at]);
+
+}
+/*****FILEIO*****/ 
+
+void editorOpen(char *filename){
+    free(term.filename);
+    term.filename = strdup(filename);
+    FILE *file = fopen(filename, "r");
+    if (!file) die("fopen");
+
+    char *line = NULL;
+    size_t linecap = 0;
+    ssize_t linelen = 0;
+    
+    while((linelen = getline(&line, &linecap, file)) != -1){
+        while(linelen > 0 && (line[linelen - 1] == '\n' || line[linelen - 1] == '\r')) linelen--;
+        rowAppend(line, linelen);
+    }
+    
+    free(line);
+    fclose(file);
+}
+
 
 
 /*****BUFFER*****/ 
@@ -135,32 +254,85 @@ void abFree(struct abuf *ab){
 }
 
 
+
 /*****OUTPUT*****/ 
+void editorScroll(){
+    term.rx = term.cx;
+    if(term.cy < term.numrows){
+        term.rx = rowCXtoRX(&term.row[term.cy], term.cx);
+    }
+    if(term.cy < term.rowoff){
+        term.rowoff = term.cy;
+    }
+
+    if(term.cy >= term.rowoff  + term.screenrows){
+        term.rowoff = term.cy - term.screenrows  + 1;
+    }
+
+    if(term.rx < term.coloff){
+        term.coloff = term.rx;
+    }
+
+    if(term.rx >= term.coloff  + term.screencolumns){
+        term.coloff = term.rx - term.screencolumns + 1;
+    }
+
+}
 
 void editorDrawRows(struct abuf *ab){
+    editorScroll();
     for(int y = 0; y < term.screenrows; y++){
-        if(y == term.screenrows / 3){
-            char welcomemsg[80];
-            int welcomelen = snprintf(welcomemsg, sizeof(welcomemsg), "SANSA --VERSION %s", SANSA_VERSION);
-            if(welcomelen > term.screencolumns) welcomelen = term.screencolumns;
-            int padding = (term.screencolumns - welcomelen)/2;
-            if(padding){
+
+        int filerow = y + term.rowoff;
+        if(filerow >= term.numrows){
+            if(term.numrows == 0 && y == term.screenrows / 3){
+                char welcomemsg[80];
+                int welcomelen = snprintf(welcomemsg, sizeof(welcomemsg), "SANSA --VERSION %s", SANSA_VERSION);
+                if(welcomelen > term.screencolumns) welcomelen = term.screencolumns;
+                int padding = (term.screencolumns - welcomelen)/2;
+                if(padding){
+                    abAppend(ab, "~", 1);
+                    padding--;
+                }
+                while(padding--){
+                    abAppend(ab, " ", 1);
+                }
+                abAppend(ab, welcomemsg, welcomelen);
+            }
+            else{ 
                 abAppend(ab, "~", 1);
-                padding--;
             }
-            while(padding--){
-                abAppend(ab, " ", 1);
-            }
-            abAppend(ab, welcomemsg, welcomelen);
         }
-        else{ 
-            abAppend(ab, "~", 1);
+        else{
+            int len = term.row[filerow].rsize - term.coloff;
+            if(len < 0) len = 0;
+            if(len > term.screencolumns) len = term.screencolumns;
+            abAppend(ab, &term.row[filerow].render[term.coloff], len);
         }
         abAppend(ab, "\x1b[K", 4); //USED TO CLEAR THE LINE, FOR DETAILS LOOK FOR VT100 GUIDE
-        if(y < term.screenrows - 1){
-            abAppend(ab, "\r\n", 2);
+        abAppend(ab, "\r\n", 2);
+    }
+}
+
+void editorDrawStatusBar(struct abuf *ab){
+    abAppend(ab, "\x1b[7m", 4); //TEXT FORMATTING FOR STATUS BAR
+    
+    char status[80], rstatus[80];
+    int len = snprintf(status, sizeof(status), "%.20s - %d Lines", term.filename ? term.filename : "[No Name]", term.numrows);
+    int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", term.cy + 1, term.numrows); 
+    if(len > term.screencolumns) len = term.screencolumns;
+    abAppend(ab, status, len);
+    while(len < term.screencolumns){
+        if(term.screencolumns - len == rlen){
+            abAppend(ab, rstatus, rlen);
+            break;
+        }
+        else{
+            abAppend(ab, " ", 1);
+            len++;
         }
     }
+    abAppend(ab, "\x1b[m", 3);
 }
 
 void editorRefreshScreen(){
@@ -170,9 +342,9 @@ void editorRefreshScreen(){
     abAppend(&ab, "\x1b[H", 3); //REPOSITION OF THE CURSOR TO THE TOP OF THE FILE                                
 
     editorDrawRows(&ab);
-    
+    editorDrawStatusBar(&ab);
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", term.cy + 1, term.cx + 1);
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", term.cy - term.rowoff + 1, term.rx - term.coloff + 1);
     abAppend(&ab, buf, strlen(buf));
 
     abAppend(&ab, "\x1b[?25h", 6); //REAPPERS THE CURSOR BEFORE REFRESHING
@@ -185,22 +357,36 @@ void editorRefreshScreen(){
 /*****INPUT*****/ 
 
 void moveCusor(char keyPress){
+    erow *row = (term.cy >= term.numrows) ? NULL : &term.row[term.cy];
     switch (keyPress) {
-        case 'j':
-           term.cy++;
+        case ARROW_DOWN:
+            if(term.cy < term.numrows) term.cy++;
            break;
-        case 'k':
-           term.cy--;
+        case ARROW_UP:
+            if(term.cy != 0) term.cy--;
            break;
-        case 'f':
-           term.cx++;
+        case ARROW_RIGHT:
+           if(row && term.cx < row->size) term.cx++;
+           else if(term.cy < term.numrows - 1){
+               term.cy++;
+               term.cx = 0;
+           }
            break;
-        case 'd':
-           term.cx--;
+        case ARROW_LEFT:
+           if(term.cx != 0) term.cx--;
+           else if(term.cy > 0){
+               term.cy--;
+               term.cx = term.row[term.cy].size;
+           }
            break;
     }
-}
 
+    row = (term.cy >= term.numrows) ? NULL : &term.row[term.cy];
+    int rowlen = row ? row->size : 0;
+    if(term.cx > rowlen){
+        term.cx = rowlen;
+    }
+}
 
 
 void editorProcessKeypress(){
@@ -221,17 +407,28 @@ void editorProcessKeypress(){
 }
 
 
+
 /*****INIT******/
 
 void initEditor(){
     term.cx = 0;
     term.cy = 0;
-    if(getWindowSize(&term.screenrows, &term.screencolumns) == - 1) die("getWindowSize");
+    term.numrows = 0;
+    term.row = NULL;
+    term.rowoff = 0;
+    term.coloff = 0;
+    term.rx = 0;
+    if(getWindowSize(&term.screenrows, &term.screencolumns) == -1) die("getWindowSize");
+    term.screenrows--;
+    term.filename = NULL;
 }
 
-int main(){
+int main(int argc, char *argv[]) {
     enableRawMode();
     initEditor();
+    if(argc >= 2){
+        editorOpen(argv[1]);
+    }
     while(1){
         editorRefreshScreen();
         editorProcessKeypress();
