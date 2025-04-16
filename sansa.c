@@ -20,17 +20,25 @@
 /*****DEFINE*****/ 
 #define CTRL_KEY(k) ((k) & 0x1f)
 #define ABUF_INIT {NULL, 0}
-#define SANSA_VERSION "0.0.2"
+#define SANSA_VERSION "0.0.3"
 #define TAB_STOP 8
 
-
-enum editorKey{
-    ARROW_LEFT = 'd',
-    ARROW_RIGHT = 'f',
-    ARROW_UP = 'k',
-    ARROW_DOWN = 'j'
+enum mode{
+    NORMAL_MODE = 0,
+    INSERT_MODE,
+    VISUAL_MODE,
 };
 
+enum editorKey{
+    BACKSPACE = 127,
+    ARROW_LEFT = 1000,
+    ARROW_RIGHT,
+    ARROW_UP,
+    ARROW_DOWN,
+    DELETE_KEY
+};
+
+enum mode currentMode = NORMAL_MODE;
 
 /*****DATA*****/
 typedef struct erow{
@@ -100,25 +108,40 @@ void enableRawMode(){
     
 }
 
-char editorKeyReader(){
+int editorKeyReader(){
     int nread;
     char keyPress;
     while((nread  = read(STDIN_FILENO, &keyPress, 1)) != 1){
         if (nread == -1 && errno != EAGAIN) die("read");
     }
-
     if(keyPress == '\x1b'){
         char seq[3];
-        if(read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
+        if(read(STDIN_FILENO, &seq[0], 1) != 1) currentMode = NORMAL_MODE;
         if(read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
         if(seq[0] == '['){
             switch(seq[1]){
-                case 'A' : return ARROW_UP;
-                case 'B' : return ARROW_DOWN;
-                case 'C' : return ARROW_RIGHT;
-                case 'D' : return ARROW_LEFT;
+                case 'A' :
+                    return ARROW_UP;
+                    break;
+                case 'B' :
+                    return ARROW_DOWN;
+                    break;
+                case 'C' :
+                    return ARROW_RIGHT;
+                    break;
+                case 'D' : 
+                    return ARROW_LEFT;
+                    break;
             }
+
+            if(read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
+            if(seq[1] == '3' && seq[2] == '~'){
+                return DELETE_KEY;
+            }
+
         }
+
+
     
         return '\x1b';
     }
@@ -198,20 +221,104 @@ void rowUpdate(erow *row){
 }
 
 
-void rowAppend(char *line, ssize_t linelen){
+void rowAppend(char *line, ssize_t linelen, int at){
+        if(at < 0 || at > term.numrows) return;
         term.row = realloc(term.row, sizeof(erow) * (term.numrows + 1));
-        
-        int at = term.numrows;
+        if(at < term.numrows){
+            memmove(&term.row[at + 1], &term.row[at], sizeof(erow) * (term.numrows - at));
+        }
         term.row[at].size = linelen;
         term.row[at].chars = malloc(linelen + 1);
         memcpy(term.row[at].chars, line, linelen);
         term.row[at].chars[linelen] = '\0';
-        term.numrows++;
         term.row[at].rsize = 0;
         term.row[at].render = NULL;
         rowUpdate(&term.row[at]);
 
+        term.numrows++;
 }
+
+void rowInsertChar(erow *row, int at, char c){
+    if(at < 0 || at > row->size) at = row->size;
+    row->chars = realloc(row->chars, row->size + 2);
+    memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+    row->size++;
+    row->chars[at] = c;
+    rowUpdate(row);
+}
+
+void rowDeleteChar(erow *row, int at){
+    if(at < 0 || at >= row->size) return;
+    memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
+    row->size--;
+    rowUpdate(row);
+}
+
+void rowAppendString(erow *row, char *str, size_t len){
+    row->chars = realloc(row->chars, row->size + len + 1);
+    memcpy(&row->chars[row->size], str, len);
+    row->size += len;
+    row->chars[row->size] = '\0';
+    rowUpdate(row);
+}
+
+void rowFree(erow *row){
+    free(row->render);
+    free(row->chars);
+}
+
+void rowDelete(int at){
+    if(at < 0 || at >= term.numrows) return;
+    rowFree(&term.row[at]);
+    memmove(&term.row[at], &term.row[at + 1], sizeof(erow) * (term.numrows - at - 1));
+    term.numrows--;
+}
+
+
+/*****EDITOROPS*****/ 
+void editorInsertChar(char c){
+    if(term.cy == term.numrows){
+        rowAppend("", 0, term.numrows);
+
+    }
+    rowInsertChar(&term.row[term.cy], term.cx, c);
+    term.cx++;
+}
+
+void editorDeleteChar(){
+    if(term.cy == term.numrows){
+        return;
+    }
+    if(term.cx == 0 && term.cy == 0){
+        return;
+    }
+    if(term.cx > 0){
+        rowDeleteChar(&term.row[term.cy], term.cx - 1);
+        term.cx--;
+    }
+    else{
+        term.cx = term.row[term.cy - 1].size;
+        rowAppendString(&term.row[term.cy - 1], term.row[term.cy].chars, term.row[term.cy].size);
+        rowDelete(term.cy);
+        term.cy--;
+    }
+}
+
+void editorInsertNewRow(){
+    if(term.cx == 0){
+        rowAppend("", 0, term.cy);
+    }
+    else{
+        erow *row = &term.row[term.cy];
+        rowAppend(&row->chars[term.cx], term.row[term.cy].size - term.cx, term.cy + 1);
+        term.row[term.cy].size = term.cx;
+        term.row[term.cy].chars[term.row[term.cy].size] = '\0';
+        rowUpdate(&term.row[term.cy]);
+    }
+        term.cy++;
+        term.cx = 0;
+}
+
 /*****FILEIO*****/ 
 
 void editorOpen(char *filename){
@@ -226,7 +333,7 @@ void editorOpen(char *filename){
     
     while((linelen = getline(&line, &linecap, file)) != -1){
         while(linelen > 0 && (line[linelen - 1] == '\n' || line[linelen - 1] == '\r')) linelen--;
-        rowAppend(line, linelen);
+        rowAppend(line, linelen, term.numrows);
     }
     
     free(line);
@@ -356,7 +463,7 @@ void editorRefreshScreen(){
 
 /*****INPUT*****/ 
 
-void moveCusor(char keyPress){
+void moveCusor(int keyPress){
     erow *row = (term.cy >= term.numrows) ? NULL : &term.row[term.cy];
     switch (keyPress) {
         case ARROW_DOWN:
@@ -364,7 +471,7 @@ void moveCusor(char keyPress){
            break;
         case ARROW_UP:
             if(term.cy != 0) term.cy--;
-           break;
+            break;
         case ARROW_RIGHT:
            if(row && term.cx < row->size) term.cx++;
            else if(term.cy < term.numrows - 1){
@@ -383,6 +490,8 @@ void moveCusor(char keyPress){
 
     row = (term.cy >= term.numrows) ? NULL : &term.row[term.cy];
     int rowlen = row ? row->size : 0;
+    
+    
     if(term.cx > rowlen){
         term.cx = rowlen;
     }
@@ -390,19 +499,68 @@ void moveCusor(char keyPress){
 
 
 void editorProcessKeypress(){
-    char keyPress = editorKeyReader();
-    switch(keyPress){
-        case CTRL_KEY('q'):
-            write(STDOUT_FILENO, "\x1b[2J", 4);
-            write(STDOUT_FILENO, "\x1b[H", 3);
-            exit(0);
+    int keyPress = editorKeyReader();
+    switch (currentMode){
+        case INSERT_MODE:
+            switch (keyPress){
+                case BACKSPACE:
+                case DELETE_KEY:
+                    if(keyPress == DELETE_KEY){
+                        moveCusor(ARROW_RIGHT);
+                    }
+                    editorDeleteChar();
+                    break;
+                case '\r':
+                    editorInsertNewRow();
+                 break;
+                case ARROW_LEFT:
+                case ARROW_RIGHT:
+                case ARROW_DOWN:
+                case ARROW_UP:
+                    moveCusor(keyPress);
+                    break;
+                default: 
+                    editorInsertChar(keyPress);
+                    break;
+            }
             break;
-        case 'd':
-        case 'f':
-        case 'j':
-        case 'k':
-            moveCusor(keyPress);
+
+        case NORMAL_MODE:
+            switch(keyPress){
+                default:
+                    break;
+                case CTRL_KEY('q'):
+                    write(STDOUT_FILENO, "\x1b[2J", 4);
+                    write(STDOUT_FILENO, "\x1b[H", 3);
+                    exit(0);
+                    break;
+                case ARROW_LEFT:
+                case ARROW_RIGHT:
+                case ARROW_DOWN:
+                case ARROW_UP:
+                    moveCusor(keyPress);
+                    break;
+               case 'd':
+                    moveCusor(ARROW_LEFT);
+                    break;
+                case 'f':
+                    moveCusor(ARROW_RIGHT);
+                    break;
+                case 'j':
+                    moveCusor(ARROW_DOWN);
+                    break;
+                case 'k':
+                    moveCusor(ARROW_UP);
+                    break;
+                case 'i':
+                    currentMode = INSERT_MODE;
+                    break;
+            }
             break;
+
+        default:
+            break;
+            
     }
 }
 
